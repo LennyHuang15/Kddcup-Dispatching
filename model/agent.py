@@ -416,8 +416,9 @@ def cal_km(xys, is_profit=True):
 gm = 0.9
 n_itv = 24 * 6
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-PATH_VALUE = os.path.join(DATA_DIR, 'Vvalue_max.json')
+PATH_VALUE = os.path.join(DATA_DIR, 'Vvalue_max_mov-grid-7.json')
 PATH_HEXS = os.path.join(DATA_DIR, 'hexagon_grid_table.csv')
+PATH_CANCEL = os.path.join(DATA_DIR, 'ccp.csv')
 class Agent(object):
     """ Agent for dispatching and reposition """
 
@@ -426,6 +427,12 @@ class Agent(object):
         self.t_start = None
         self._load_hexs()
         self._load_value()
+        self._load_cancel()
+
+    def _load_cancel(self):
+        with open(PATH_CANCEL) as f:
+            self.cancel = np.array(pd.read_csv(PATH_CANCEL, header=None)).reshape(-1)
+            print("cancel prob", self.cancel.shape)
 
     def _load_value(self):
         with open(PATH_VALUE) as f:
@@ -445,13 +452,20 @@ class Agent(object):
         return min((int(ts)-self.t_start)//600, n_itv - 1)
     def coor2hex(self, coor):
         return self.tree.query([coor])[1][0][0]
+    def cancel_rate(self, d_pu):
+        idx = min(int(d_pu / 200), len(self.cancel) - 1)
+        return self.cancel[idx]
     def cal_cost(self, ob):
         t_cur, t_dst = self.ts2itv(ob['timestamp']), self.ts2itv(ob['order_finish_timestamp'] + ob['pick_up_eta'])
-        dur = max(t_dst - t_cur, 1)
+        # dur = max(t_dst - t_cur, 1)
+        dur = int(ob['order_finish_timestamp'] + ob['pick_up_eta'] - ob['timestamp']) + 1
         rw_u = ob['reward_units'] / dur
         rw = sum([rw_u * gm**i for i in range(dur)])
         h_cur, h_dst = self.coor2hex(ob['driver_location']), self.coor2hex(ob['order_finish_location'])
         adv = self.vmat[h_dst][t_dst] * gm**dur + rw - self.vmat[h_cur][t_cur]
+        # expectation with cancel rate
+        cr = self.cancel_rate(ob['order_driver_distance'])
+        adv *= 1 - cr
         return adv
     
     def dispatch(self, dispatch_observ):
@@ -482,7 +496,8 @@ class Agent(object):
             self.t_start = int(ts.timestamp())
             print("start time", first_t, ts, self.t_start)
         
-        # res = self.dispatch_greedy(dispatch_observ)
+        # res = self.dispatch_greedy_reward(dispatch_observ)
+        # res = self.dispatch_greedy_pickup(dispatch_observ)
         res = self.dispatch_greedy_value(dispatch_observ)
         # res = self.dispatch_min_dist(dispatch_observ)
         # res = self.dispatch_max_val(dispatch_observ)
@@ -501,33 +516,34 @@ class Agent(object):
         matching, score = cal_km(xys, is_profit=False)
         return matching
 
-    def dispatch_greedy(self, dispatch_observ):
-        dispatch_observ.sort(key=lambda od_info: od_info['reward_units'], reverse=True)
+    def dispatch_greedy(self, xys):
         assigned_order, assigned_driver = set(), set()
-        xys = []
-        for od in dispatch_observ:
+        res = []
+        for x, y, t in xys:
             # make sure each order is assigned to one driver, and each driver is assigned with one order
-            if (od["order_id"] in assigned_order) or (od["driver_id"] in assigned_driver):
+            if (x in assigned_order) or (y in assigned_driver):
                 continue
-            assigned_order.add(od["order_id"])
-            assigned_driver.add(od["driver_id"])
-            xys.append((od["order_id"], od["driver_id"], od['reward_units']))
-        return xys
+            assigned_order.add(x)
+            assigned_driver.add(y)
+            res.append((x, y, t))
+        return res
+
+    def dispatch_greedy_reward(self, dispatch_observ):
+        dispatch_observ.sort(key=lambda od_info: od_info['reward_units'], reverse=True)
+        xys = [(od["order_id"], od["driver_id"], od['reward_units']) for od in dispatch_observ]
+        return self.dispatch_greedy(xys)
+        
+    def dispatch_greedy_pickup(self, dispatch_observ):
+        dispatch_observ.sort(key=lambda od_info: od_info['pick_up_eta'], reverse=False)
+        xys = [(od["order_id"], od["driver_id"], od['pick_up_eta']) for od in dispatch_observ]
+        return self.dispatch_greedy(xys)
 
     def dispatch_greedy_value(self, dispatch_observ):
         for ob in dispatch_observ:
             ob['vvalue'] = self.cal_cost(ob)
         dispatch_observ.sort(key=lambda od_info: od_info['vvalue'], reverse=True)
-        assigned_order, assigned_driver = set(), set()
-        xys = []
-        for od in dispatch_observ:
-            # make sure each order is assigned to one driver, and each driver is assigned with one order
-            if (od["order_id"] in assigned_order) or (od["driver_id"] in assigned_driver):
-                continue
-            assigned_order.add(od["order_id"])
-            assigned_driver.add(od["driver_id"])
-            xys.append((od["order_id"], od["driver_id"], od['vvalue']))
-        return xys
+        xys = [(od["order_id"], od["driver_id"], od['vvalue']) for od in dispatch_observ]
+        return self.dispatch_greedy(xys)
 
     def reposition(self, repo_observ):
         """ Compute the reposition action for the given drivers
